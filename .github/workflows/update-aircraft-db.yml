@@ -1,0 +1,79 @@
+name: Update Aircraft Database
+
+on:
+  schedule:
+    - cron: '0 3 * * 1'   # Monday 03:00 UTC weekly
+  workflow_dispatch:        # manual trigger
+
+permissions:
+  contents: write           # needed to create releases
+
+jobs:
+  build-db:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Fetch previous aircraft.db from latest release
+        id: prev-db
+        run: |
+          mkdir -p /tmp/aircraft-build
+          gh release download latest \
+            --pattern "aircraft.db" \
+            --dir /tmp/aircraft-build \
+            --repo "$GITHUB_REPOSITORY" \
+            --clobber 2>/dev/null && \
+            echo "found=true" >> "$GITHUB_OUTPUT" || \
+            echo "found=false" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Generate aircraft.db
+        run: |
+          PREV_ARG=""
+          if [ "${{ steps.prev-db.outputs.found }}" = "true" ]; then
+            PREV_ARG="--previous-db /tmp/aircraft-build/aircraft.db"
+          fi
+          python3 generate_aircraft_db.py \
+            $PREV_ARG \
+            --output /tmp/aircraft-build/aircraft_new.db
+
+      - name: Compute SHA-256 and version tag
+        id: meta
+        run: |
+          SHA=$(shasum -a 256 /tmp/aircraft-build/aircraft_new.db | awk '{print $1}')
+          TAG="aircraft-db-$(date -u +%Y%m%d)"
+          echo "sha256=$SHA"  >> "$GITHUB_OUTPUT"
+          echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
+          echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+
+      - name: Write manifest.json
+        run: |
+          cat > /tmp/aircraft-build/manifest.json << EOF
+          {
+            "version": "${{ steps.meta.outputs.tag }}",
+            "date": "${{ steps.meta.outputs.date }}",
+            "sha256": "${{ steps.meta.outputs.sha256 }}",
+            "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/aircraft.db",
+            "minAppVersion": "1.0"
+          }
+          EOF
+          cp /tmp/aircraft-build/aircraft_new.db /tmp/aircraft-build/aircraft.db
+
+      - name: Create GitHub Release and upload assets
+        run: |
+          gh release create "${{ steps.meta.outputs.tag }}" \
+            --title "Aircraft DB ${{ steps.meta.outputs.tag }}" \
+            --notes "Weekly aircraft database update. SHA-256: ${{ steps.meta.outputs.sha256 }}" \
+            /tmp/aircraft-build/aircraft.db \
+            /tmp/aircraft-build/manifest.json \
+            --repo "$GITHUB_REPOSITORY"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
