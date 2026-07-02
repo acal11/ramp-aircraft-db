@@ -54,16 +54,38 @@ jobs:
           echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
 
-      - name: Write manifest.json
+      - name: Sign and write manifest.json
+        env:
+          SIGNING_PRIVATE_KEY: ${{ secrets.SIGNING_PRIVATE_KEY }}
+          TAG: ${{ steps.meta.outputs.tag }}
+          DATE: ${{ steps.meta.outputs.date }}
+          REPO: ${{ github.repository }}
         run: |
-          cat > /tmp/aircraft-build/manifest.json << EOF
-          {
-            "version": "${{ steps.meta.outputs.tag }}",
-            "date": "${{ steps.meta.outputs.date }}",
-            "sha256": "${{ steps.meta.outputs.sha256 }}",
-            "url": "https://github.com/${{ github.repository }}/releases/download/${{ steps.meta.outputs.tag }}/aircraft.db",
-            "minAppVersion": "1.0"
+          pip install cryptography --quiet
+          python3 - <<'EOF'
+          import os, base64, hashlib, json
+          from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+
+          priv = Ed25519PrivateKey.from_private_bytes(
+              base64.b64decode(os.environ["SIGNING_PRIVATE_KEY"]))
+
+          with open("/tmp/aircraft-build/aircraft_new.db", "rb") as f:
+              sha256_hex = hashlib.sha256(f.read()).hexdigest()
+
+          signature = base64.b64encode(priv.sign(sha256_hex.encode())).decode()
+
+          tag, repo = os.environ["TAG"], os.environ["REPO"]
+          manifest = {
+              "version": tag,
+              "date": os.environ["DATE"],
+              "sha256": sha256_hex,
+              "signature": signature,
+              "url": f"https://github.com/{repo}/releases/download/{tag}/aircraft.db",
+              "minAppVersion": "1.0"
           }
+          with open("/tmp/aircraft-build/manifest.json", "w") as f:
+              json.dump(manifest, f, indent=2)
+          print(f"sha256={sha256_hex[:16]}… sig={signature[:16]}…")
           EOF
           cp /tmp/aircraft-build/aircraft_new.db /tmp/aircraft-build/aircraft.db
 
