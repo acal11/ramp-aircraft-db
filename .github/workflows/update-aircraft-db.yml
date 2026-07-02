@@ -85,7 +85,8 @@ jobs:
           }
           with open("/tmp/aircraft-build/manifest.json", "w") as f:
               json.dump(manifest, f, indent=2)
-          print(f"sha256={sha256_hex[:16]}… sig={signature[:16]}…")
+          print(f"aircraft.db: sha256={sha256_hex[:16]}… sig={signature[:16]}…")
+          print("Signed manifest written.")
           EOF
           cp /tmp/aircraft-build/aircraft_new.db /tmp/aircraft-build/aircraft.db
 
