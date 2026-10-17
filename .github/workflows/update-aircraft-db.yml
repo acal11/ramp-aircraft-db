@@ -94,9 +94,16 @@ jobs:
         run: |
           SHA=$(shasum -a 256 /tmp/aircraft-build/aircraft_new.db | awk '{print $1}')
           TAG="aircraft-db-$(date -u +%Y%m%d)"
+          # A second run on the same day (a manual recovery, then a seeded run) would
+          # otherwise collide with that day's tag and fail at the upload step.
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAG="$TAG-$(date -u +%H%M)"
+          fi
           echo "sha256=$SHA"  >> "$GITHUB_OUTPUT"
           echo "tag=$TAG"     >> "$GITHUB_OUTPUT"
           echo "date=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> "$GITHUB_OUTPUT"
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Sign and write manifest.json
         env:
