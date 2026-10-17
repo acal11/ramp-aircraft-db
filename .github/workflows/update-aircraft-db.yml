@@ -4,6 +4,15 @@ on:
   schedule:
     - cron: '0 3 * * 1'   # Monday 03:00 UTC weekly
   workflow_dispatch:        # manual trigger
+    inputs:
+      previous_tag:
+        description: "Release to merge from instead of the latest (e.g. aircraft-db-20261005 to recover from a bad build)"
+        required: false
+        default: ""
+      allow_shrink:
+        description: "Publish even if the release gate reports a large drop (only for a confirmed upstream change)"
+        type: boolean
+        default: false
 
 permissions:
   contents: write           # needed to create releases
@@ -21,19 +30,27 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Fetch previous aircraft.db from latest release
+      - name: Fetch previous aircraft.db
         id: prev-db
+        # No tag argument means the latest release. The tag `latest` does not exist
+        # (releases are tagged aircraft-db-YYYYMMDD), so naming it failed every run,
+        # the failure was swallowed, and --previous-db never loaded.
         run: |
           mkdir -p /tmp/aircraft-build
-          gh release download latest \
-            --pattern "aircraft.db" \
-            --dir /tmp/aircraft-build \
-            --repo "$GITHUB_REPOSITORY" \
-            --clobber 2>/dev/null && \
-            echo "found=true" >> "$GITHUB_OUTPUT" || \
+          if [ -n "$PREVIOUS_TAG" ]; then
+            gh release download "$PREVIOUS_TAG" --pattern "aircraft.db" \
+              --dir /tmp/aircraft-build --repo "$GITHUB_REPOSITORY" --clobber
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          elif [ -n "$(gh release list --limit 1 --repo "$GITHUB_REPOSITORY")" ]; then
+            gh release download --pattern "aircraft.db" \
+              --dir /tmp/aircraft-build --repo "$GITHUB_REPOSITORY" --clobber
+            echo "found=true" >> "$GITHUB_OUTPUT"
+          else
             echo "found=false" >> "$GITHUB_OUTPUT"
+          fi
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PREVIOUS_TAG: ${{ inputs.previous_tag }}
 
       - name: Generate aircraft.db
         run: |
@@ -44,6 +61,15 @@ jobs:
           python3 generate_aircraft_db.py \
             $PREV_ARG \
             --output /tmp/aircraft-build/aircraft_new.db
+
+      - name: Release gate - refuse a build that shrank suspiciously
+        if: ${{ !inputs.allow_shrink }}
+        run: |
+          PREV_ARG=""
+          if [ "${{ steps.prev-db.outputs.found }}" = "true" ]; then
+            PREV_ARG="--previous /tmp/aircraft-build/aircraft.db"
+          fi
+          python3 check_db_shrink.py /tmp/aircraft-build/aircraft_new.db $PREV_ARG
 
       - name: Compute SHA-256 and version tag
         id: meta
