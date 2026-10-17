@@ -375,15 +375,49 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
     inserted   = 0
     skipped    = 0
     duplicates = 0
+    carried    = 0
     retired    = 0
     seen_icao  = set()
+    # Every hex the source still lists with a registration and type, whether or not
+    # the operator filter keeps it. Only a hex missing from this set has left the
+    # source; one the filter drops is still flying and must not be marked retired.
+    in_source  = set()
 
     for row in rows:
+        icao24 = row[COL_ICAO24].strip().lower() if row else ""
+        has_identity = (len(row) > COL_TYPECODE
+                        and row[COL_REGISTRATION].strip() and row[COL_TYPECODE].strip())
+        if icao24 and has_identity:
+            in_source.add(icao24)
+
         if not should_include(row, include_all):
+            # The operator column comes from ADS-B Exchange alone (via tar1090-db) and has
+            # dropped whole registers at once: VH went from 16,102 rows to 334 between the
+            # 2026-10-05 and 2026-10-12 builds. A row that lost only its operator keeps the
+            # operator the previous build had, as long as the registration is unchanged -
+            # a re-registration usually means a new owner.
+            prev = prev_rows.get(icao24)
+            if (has_identity and prev and prev["operator"] and icao24 not in seen_icao
+                    and prev["registration"] == row[COL_REGISTRATION].strip().upper()):
+                seen_icao.add(icao24)
+                op = prev["operator"]
+                cur.execute(
+                    "INSERT INTO aircraft VALUES (?,?,?,?,?,?,?)",
+                    (
+                        icao24,
+                        row[COL_REGISTRATION].strip().upper(),
+                        row[COL_TYPECODE].strip().upper(),
+                        row[COL_TYPE_LONG].strip() if len(row) > COL_TYPE_LONG else "",
+                        op,
+                        1,
+                        to_display_name(op),
+                    ),
+                )
+                carried += 1
+                continue
             skipped += 1
             continue
 
-        icao24 = row[COL_ICAO24].strip().lower()
         if not icao24 or icao24 in seen_icao:
             duplicates += 1
             continue
@@ -404,11 +438,14 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
         if inserted % 10_000 == 0:
             print(f"  … {inserted:,} rows inserted")
 
-    # Preserve retired aircraft from the previous DB (active=0)
+    if carried:
+        print(f"  … {carried:,} aircraft kept with the previous build's operator (source dropped it)")
+
+    # Preserve aircraft that have left the source data entirely (active=0)
     if prev_rows:
         for icao24, prev in prev_rows.items():
-            if icao24 in seen_icao:
-                continue  # still in the new data — already inserted above
+            if icao24 in seen_icao or icao24 in in_source:
+                continue  # still in the source, so not retired
             # Re-insert with active=0 to preserve history
             op = prev["operator"]
             cur.execute(
@@ -435,7 +472,7 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
     conn.close()
 
     print(f"  Skipped {skipped:,} rows, {duplicates:,} duplicates")
-    return inserted
+    return inserted + carried
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
