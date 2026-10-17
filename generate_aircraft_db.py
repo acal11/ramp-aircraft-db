@@ -17,9 +17,9 @@ from the new CSV is re-inserted with active=0 so historical sightings retain
 their type and operator data.
 
 Usage:
-    python3 scripts/generate_aircraft_db.py                      # filtered (default)
-    python3 scripts/generate_aircraft_db.py --all                # all with reg+type
+    python3 scripts/generate_aircraft_db.py                      # every row with reg+type
     python3 scripts/generate_aircraft_db.py --previous-db PATH   # merge retired aircraft
+    python3 scripts/generate_aircraft_db.py --seed-db PATH       # fill missing operators from an older DB
     python3 scripts/generate_aircraft_db.py --output PATH        # write to custom path
 
 Run from the root of the Ramp project directory.
@@ -246,31 +246,30 @@ def to_display_name(raw: str) -> str:
 
 # ── Filter criteria ────────────────────────────────────────────────────────────
 #
-# Goal: include the aircraft a planespotter would realistically see at a
-# commercial airport, while keeping the bundle size reasonable.
-#
-# Include a row when ALL of the following are true:
-#   1. registration is non-empty
-#   2. typecode is non-empty
-#   3. operator is non-empty   (filters to fleet/commercial aircraft)
-#
-# Pass --all to skip criterion 3 (adds private/GA aircraft; roughly 3× larger).
-# Estimated row counts:  --all ≈ 300–400k rows,  default ≈ 30–60k rows.
-# Estimated SQLite size: --all ≈ 30–50 MB,        default ≈ 5–10 MB.
+# Include every row with a registration and a type code. There is deliberately
+# no operator filter (removed 2026-10-17). The operator column comes from
+# ADS-B Exchange alone and is populated almost only for the US register, so
+# filtering on it left the database ~95% US, excluded every non-Australian A380,
+# and let one upstream change remove an entire register in a week (VH, 2026-10-12).
+# Measured 2026-10-17: ~493k rows, ~58 MB.
 
-def should_include(row: list[str], include_all: bool) -> bool:
-    if len(row) <= COL_OPERATOR:
+def should_include(row: list[str]) -> bool:
+    if len(row) <= COL_TYPECODE:
         return False
+    return bool(row[COL_REGISTRATION].strip() and row[COL_TYPECODE].strip())
 
-    registration = row[COL_REGISTRATION].strip()
-    typecode     = row[COL_TYPECODE].strip()
-    operator_    = row[COL_OPERATOR].strip()
 
-    if not registration or not typecode:
-        return False
-    if not include_all and not operator_:
-        return False
-    return True
+def carried_operator(icao24: str, registration: str, *sources: dict) -> str:
+    """The first operator a previous build recorded for this airframe, or "".
+
+    Sources are checked in order, freshest first. An operator is carried only while the
+    registration is unchanged - a re-registration usually means a new owner.
+    """
+    for source in sources:
+        prev = source.get(icao24)
+        if prev and prev["operator"] and prev["registration"] == registration:
+            return prev["operator"]
+    return ""
 
 
 # ── Download ───────────────────────────────────────────────────────────────────
@@ -361,7 +360,7 @@ CREATE_INDEX_REG    = "CREATE INDEX idx_registration ON aircraft (registration);
 CREATE_INDEX_BRAND  = "CREATE INDEX idx_brand ON aircraft (brand);"
 
 
-def build_database(rows: list[list[str]], output_path: str, include_all: bool, prev_rows: dict) -> int:
+def build_database(rows: list[list[str]], output_path: str, prev_rows: dict, seed_rows: dict) -> int:
     os.makedirs(os.path.dirname(os.path.abspath(output_path)), exist_ok=True)
 
     # Remove stale database
@@ -376,48 +375,16 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
     skipped    = 0
     duplicates = 0
     carried    = 0
+    seeded     = 0
     retired    = 0
     seen_icao  = set()
-    # Every hex the source still lists with a registration and type, whether or not
-    # the operator filter keeps it. Only a hex missing from this set has left the
-    # source; one the filter drops is still flying and must not be marked retired.
-    in_source  = set()
 
     for row in rows:
-        icao24 = row[COL_ICAO24].strip().lower() if row else ""
-        has_identity = (len(row) > COL_TYPECODE
-                        and row[COL_REGISTRATION].strip() and row[COL_TYPECODE].strip())
-        if icao24 and has_identity:
-            in_source.add(icao24)
-
-        if not should_include(row, include_all):
-            # The operator column comes from ADS-B Exchange alone (via tar1090-db) and has
-            # dropped whole registers at once: VH went from 16,102 rows to 334 between the
-            # 2026-10-05 and 2026-10-12 builds. A row that lost only its operator keeps the
-            # operator the previous build had, as long as the registration is unchanged -
-            # a re-registration usually means a new owner.
-            prev = prev_rows.get(icao24)
-            if (has_identity and prev and prev["operator"] and icao24 not in seen_icao
-                    and prev["registration"] == row[COL_REGISTRATION].strip().upper()):
-                seen_icao.add(icao24)
-                op = prev["operator"]
-                cur.execute(
-                    "INSERT INTO aircraft VALUES (?,?,?,?,?,?,?)",
-                    (
-                        icao24,
-                        row[COL_REGISTRATION].strip().upper(),
-                        row[COL_TYPECODE].strip().upper(),
-                        row[COL_TYPE_LONG].strip() if len(row) > COL_TYPE_LONG else "",
-                        op,
-                        1,
-                        to_display_name(op),
-                    ),
-                )
-                carried += 1
-                continue
+        if not should_include(row):
             skipped += 1
             continue
 
+        icao24 = row[COL_ICAO24].strip().lower()
         if not icao24 or icao24 in seen_icao:
             duplicates += 1
             continue
@@ -427,7 +394,23 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
         typecode     = row[COL_TYPECODE].strip().upper()
         type_long    = row[COL_TYPE_LONG].strip() if len(row) > COL_TYPE_LONG else ""
         operator_    = row[COL_OPERATOR].strip() if len(row) > COL_OPERATOR else ""
-        brand        = to_display_name(operator_) if operator_ else ""
+
+        # The source drops operators in bulk (VH went from 16,102 to 334 between the
+        # 2026-10-05 and 2026-10-12 builds), so an airframe that lost its operator keeps
+        # the one the previous build had, then the seed's. The seed skips US registrations:
+        # the source tracks the FAA register daily, so a blank N-number owner there is an
+        # individual change (a sale, a deregistration) rather than an outage, and an
+        # older build's owner would be stale.
+        if not operator_:
+            operator_ = carried_operator(icao24, registration, prev_rows)
+            if operator_:
+                carried += 1
+            elif not (registration.startswith("N") and "-" not in registration):
+                operator_ = carried_operator(icao24, registration, seed_rows)
+                if operator_:
+                    seeded += 1
+
+        brand = to_display_name(operator_) if operator_ else ""
 
         cur.execute(
             "INSERT INTO aircraft VALUES (?,?,?,?,?,?,?)",
@@ -435,16 +418,18 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
         )
         inserted += 1
 
-        if inserted % 10_000 == 0:
+        if inserted % 50_000 == 0:
             print(f"  … {inserted:,} rows inserted")
 
     if carried:
-        print(f"  … {carried:,} aircraft kept with the previous build's operator (source dropped it)")
+        print(f"  … {carried:,} operators carried from the previous build (source dropped them)")
+    if seeded:
+        print(f"  … {seeded:,} operators filled from the seed DB")
 
     # Preserve aircraft that have left the source data entirely (active=0)
     if prev_rows:
         for icao24, prev in prev_rows.items():
-            if icao24 in seen_icao or icao24 in in_source:
+            if icao24 in seen_icao:
                 continue  # still in the source, so not retired
             # Re-insert with active=0 to preserve history
             op = prev["operator"]
@@ -472,29 +457,24 @@ def build_database(rows: list[list[str]], output_path: str, include_all: bool, p
     conn.close()
 
     print(f"  Skipped {skipped:,} rows, {duplicates:,} duplicates")
-    return inserted + carried
+    return inserted
 
 
 # ── Main ───────────────────────────────────────────────────────────────────────
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="Generate Ramp aircraft.db from tar1090-db")
-    parser.add_argument("--all", action="store_true",
-                        help="Include all aircraft with registration + typecode (no operator filter)")
     parser.add_argument("--previous-db", metavar="PATH", default=None,
-                        help="Path to the previous aircraft.db; retired aircraft are preserved with active=0")
+                        help="Path to the previous aircraft.db; retired aircraft are preserved with active=0, "
+                             "and dropped operators are carried forward")
+    parser.add_argument("--seed-db", metavar="PATH", default=None,
+                        help="An older aircraft.db used only to fill operators that neither the source nor "
+                             "--previous-db has. Contributes no rows of its own")
     parser.add_argument("--output", metavar="PATH", default=DEFAULT_OUTPUT,
                         help="Output path for the generated aircraft.db")
     args = parser.parse_args()
 
-    include_all = args.all
     output_path = os.path.abspath(args.output)
-
-    if include_all:
-        print("Mode: --all  (all aircraft with registration + typecode)")
-    else:
-        print("Mode: default  (commercial/fleet aircraft with operator populated)")
-        print("      Pass --all to include private/GA aircraft (~5-10× larger)")
 
     prev_rows: dict = {}
     if args.previous_db:
@@ -502,10 +482,16 @@ def main() -> None:
         prev_rows = load_previous_db(args.previous_db)
         print(f"  {len(prev_rows):,} entries in previous DB")
 
+    seed_rows: dict = {}
+    if args.seed_db:
+        print(f"Loading seed DB: {args.seed_db}")
+        seed_rows = load_previous_db(args.seed_db)
+        print(f"  {len(seed_rows):,} entries in seed DB")
+
     rows = download_csv()
     print(f"Loaded {len(rows):,} rows from CSV")
 
-    count = build_database(rows, output_path, include_all, prev_rows)
+    count = build_database(rows, output_path, prev_rows, seed_rows)
 
     size_mb = os.path.getsize(output_path) / (1024 * 1024)
     print(f"\n✓ Written {count:,} aircraft to {output_path}")

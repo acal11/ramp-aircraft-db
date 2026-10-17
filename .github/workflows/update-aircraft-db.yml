@@ -9,6 +9,10 @@ on:
         description: "Release to merge from instead of the latest (e.g. aircraft-db-20261005 to recover from a bad build)"
         required: false
         default: ""
+      seed_tag:
+        description: "Older release used only to fill operators nothing newer has (e.g. aircraft-db-20260803, the last with Canadian operators)"
+        required: false
+        default: ""
       allow_shrink:
         description: "Publish even if the release gate reports a large drop (only for a confirmed upstream change)"
         type: boolean
@@ -52,14 +56,28 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           PREVIOUS_TAG: ${{ inputs.previous_tag }}
 
+      - name: Fetch seed aircraft.db
+        if: ${{ inputs.seed_tag != '' }}
+        run: |
+          mkdir -p /tmp/aircraft-seed
+          gh release download "$SEED_TAG" --pattern "aircraft.db" \
+            --dir /tmp/aircraft-seed --repo "$GITHUB_REPOSITORY" --clobber
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          SEED_TAG: ${{ inputs.seed_tag }}
+
       - name: Generate aircraft.db
         run: |
           PREV_ARG=""
           if [ "${{ steps.prev-db.outputs.found }}" = "true" ]; then
             PREV_ARG="--previous-db /tmp/aircraft-build/aircraft.db"
           fi
+          SEED_ARG=""
+          if [ -f /tmp/aircraft-seed/aircraft.db ]; then
+            SEED_ARG="--seed-db /tmp/aircraft-seed/aircraft.db"
+          fi
           python3 generate_aircraft_db.py \
-            $PREV_ARG \
+            $PREV_ARG $SEED_ARG \
             --output /tmp/aircraft-build/aircraft_new.db
 
       - name: Release gate - refuse a build that shrank suspiciously
